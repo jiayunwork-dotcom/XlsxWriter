@@ -11,6 +11,7 @@
 import operator
 import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -41,7 +42,7 @@ from .exceptions import (
 )
 from .format import Format
 from .packager import Packager
-from .sharedstrings import SharedStringTable
+from .sharedstrings import DiskSharedStringTable, SharedStringTable
 from .utility import xl_cell_to_rowcol
 from .worksheet import Worksheet
 
@@ -86,6 +87,7 @@ class Workbook(xmlwriter.XMLwriter):
         self.default_date_format = options.get("default_date_format", None)
         self.constant_memory = options.get("constant_memory", False)
         self.in_memory = options.get("in_memory", False)
+        self.shared_strings = options.get("shared_strings", None)
         self.excel2003_style = options.get("excel2003_style", False)
         self.remove_timezone = options.get("remove_timezone", False)
         self.use_future_functions = options.get("use_future_functions", False)
@@ -134,7 +136,29 @@ class Workbook(xmlwriter.XMLwriter):
         self.window_width = 16095
         self.window_height = 9660
         self.tab_ratio = 600
+
+        # Validate the 'shared_strings' option before any temp files are
+        # created so that an invalid combination doesn't leave them behind.
+        if self.shared_strings not in (None, "disk"):
+            raise ValueError(
+                f"Unknown 'shared_strings' option value '{self.shared_strings}'. "
+                "The only supported value is 'disk'."
+            )
+
+        if self.shared_strings == "disk" and not (
+            self.constant_memory and not self.in_memory
+        ):
+            raise ValueError(
+                "The 'shared_strings' = 'disk' option requires "
+                "'constant_memory' = True and 'in_memory' = False."
+            )
+
         self.str_table = SharedStringTable()
+        if self.shared_strings == "disk":
+            # Use a disk backed shared string table. It lives in the
+            # workbook's tmpdir and is cleaned up when the workbook is
+            # closed.
+            self.str_table = DiskSharedStringTable(self.tmpdir)
         self.vba_project = None
         self.vba_project_is_stream = False
         self.vba_project_signature = None
@@ -392,16 +416,32 @@ class Workbook(xmlwriter.XMLwriter):
                     "Filesize would require ZIP64 extensions. "
                     "Use workbook.use_zip64()."
                 )
+            finally:
+                # Always release the disk backed shared string store and any
+                # constant_memory row files. This happens for success and
+                # failure so temp files don't leak.
+                self._cleanup_temp_resources()
 
             self.fileclosed = True
 
-            # Ensure all constant_memory temp files are closed.
-            if self.constant_memory:
-                for worksheet in self.worksheets():
-                    worksheet._opt_close()
-
         else:
             warn("Calling close() on already closed file.")
+
+    def _cleanup_temp_resources(self) -> None:
+        # Close and remove any temp resources owned by this workbook. Existing
+        # files that aren't ours are left untouched.
+        if getattr(self.str_table, "is_disk", False):
+            try:
+                self.str_table._close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+        if self.constant_memory:
+            for worksheet in self.worksheets():
+                try:
+                    worksheet._cleanup_temp_files()
+                except Exception:  # pylint: disable=broad-except
+                    pass
 
     def set_size(self, width: int, height: int) -> None:
         """
@@ -741,15 +781,50 @@ class Workbook(xmlwriter.XMLwriter):
 
     def _store_workbook(self) -> None:
         # pylint: disable=consider-using-with
+        # Fail early if the disk backed shared string store hit an error while
+        # data was being written. Otherwise a partial file could be produced.
+        if getattr(self.str_table, "failed", False):
+            raise IOError("The disk backed shared string store failed.")
+
         # Create the xlsx/zip file.
+        # In disk backed shared string mode, write to a temporary file in the
+        # same directory and move it into place only on success. This ensures
+        # that a failure part way through doesn't destroy an existing file at
+        # the target path. Other modes keep the original direct-write
+        # behavior.
+        write_filename = self.filename
+        atomic_tmp = None
+
+        use_atomic = (
+            self.shared_strings == "disk"
+            and isinstance(self.filename, (str, os.PathLike))
+        )
+
+        if use_atomic:
+            target = os.fspath(self.filename)
+            target_dir = os.path.dirname(os.path.abspath(target))
+            try:
+                (fd, atomic_tmp) = tempfile.mkstemp(
+                    dir=target_dir, prefix=".xlsxwriter_", suffix=".tmp"
+                )
+                os.close(fd)
+                write_filename = atomic_tmp
+            except OSError:
+                # Fall back to writing directly if a sibling temp file can't
+                # be created.
+                atomic_tmp = None
+                write_filename = self.filename
+
         try:
             xlsx_file = ZipFile(
-                self.filename,
+                write_filename,
                 "w",
                 compression=ZIP_DEFLATED,
                 allowZip64=self.allow_zip64,
             )
         except IOError as e:
+            if atomic_tmp is not None:
+                self._safe_remove(atomic_tmp)
             raise e
 
         # Assemble worksheets into a workbook.
@@ -800,13 +875,68 @@ class Workbook(xmlwriter.XMLwriter):
         packager._add_workbook(self)
         packager._set_tmpdir(self.tmpdir)
         packager._set_in_memory(self.in_memory)
-        xml_files = packager._create_package()
+        xml_files = []
+        succeeded = False
+        try:
+            xml_files = packager._create_package()
 
-        # Free up the Packager object.
-        packager = None
+            # Free up the Packager object.
+            packager = None
 
-        # Add XML sub-files to the Zip file with their Excel filename.
-        for file_id, file_data in enumerate(xml_files):
+            # Add XML sub-files to the Zip file with their Excel filename.
+            self._write_zip_files(xlsx_file, xml_files)
+            succeeded = True
+        finally:
+            # Close the zip file even if packaging/writing failed.
+            try:
+                xlsx_file.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+            # Remove any XML temp files that weren't already consumed.
+            for file_data in xml_files:
+                os_filename = file_data[0]
+                if isinstance(os_filename, str):
+                    self._safe_remove(os_filename)
+
+            if atomic_tmp is not None:
+                if succeeded:
+                    try:
+                        self._copy_output_mode(atomic_tmp, os.fspath(self.filename))
+                        os.replace(atomic_tmp, os.fspath(self.filename))
+                    except OSError:
+                        self._safe_remove(atomic_tmp)
+                        raise
+                else:
+                    self._safe_remove(atomic_tmp)
+
+    @staticmethod
+    def _copy_output_mode(tmp_filename, target_filename) -> None:
+        # Match the permissions of an existing target file, or use the normal
+        # default create mode, so the atomic write doesn't change the expected
+        # file permissions.
+        try:
+            if os.path.exists(target_filename):
+                mode = os.stat(target_filename).st_mode & 0o777
+            else:
+                umask = os.umask(0)
+                os.umask(umask)
+                mode = 0o666 & ~umask
+            os.chmod(tmp_filename, mode)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _safe_remove(filename) -> None:
+        # Remove a temp file, ignoring errors.
+        try:
+            os.remove(filename)
+        except OSError:
+            pass
+
+    def _write_zip_files(self, xlsx_file, xml_files) -> None:
+        # Add the packaged XML sub-files to the Zip file.
+        for file_data in xml_files:
             os_filename, xml_filename, is_binary = file_data
 
             if self.in_memory:
@@ -828,16 +958,8 @@ class Workbook(xmlwriter.XMLwriter):
                 timestamp = time.mktime((1980, 1, 31, 0, 0, 0, 0, 0, -1))
                 os.utime(os_filename, (timestamp, timestamp))
 
-                try:
-                    xlsx_file.write(os_filename, xml_filename)
-                    os.remove(os_filename)
-                except LargeZipFile as e:
-                    # Close open temp files on zipfile.LargeZipFile exception.
-                    for i in range(file_id, len(xml_files) - 1):
-                        os.remove(xml_files[i][0])
-                    raise e
-
-        xlsx_file.close()
+                xlsx_file.write(os_filename, xml_filename)
+                os.remove(os_filename)
 
     def _add_sheet(self, name, worksheet_class=None):
         # Utility for shared code in add_worksheet() and add_chartsheet().
@@ -857,6 +979,7 @@ class Workbook(xmlwriter.XMLwriter):
             "str_table": self.str_table,
             "worksheet_meta": self.worksheet_meta,
             "constant_memory": self.constant_memory,
+            "disk_shared_strings": self.shared_strings == "disk",
             "tmpdir": self.tmpdir,
             "date_1904": self.date_1904,
             "strings_to_numbers": self.strings_to_numbers,
@@ -1589,7 +1712,6 @@ class Workbook(xmlwriter.XMLwriter):
     def _prepare_sst_string_data(self) -> None:
         # Convert the SST string data from a dict to a list.
         self.str_table._sort_string_data()
-
     def _get_packager(self):
         # Get and instance of the Packager class to create the xlsx package.
         # This allows the default packager to be over-ridden.

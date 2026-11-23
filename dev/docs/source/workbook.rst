@@ -53,6 +53,32 @@ The constructor options are:
 
   See :ref:`memory_perf` for more details.
 
+* **shared_strings**: In ``constant_memory`` mode cell strings are normally
+  written as "in-line" strings instead of being added to the workbook
+  ``sharedStrings.xml`` table. Setting ``shared_strings`` to ``'disk'`` keeps
+  a real shared string table while still allowing the workbook to be written
+  with a bounded amount of memory::
+
+       workbook = xlsxwriter.Workbook(
+           filename,
+           {'constant_memory': True, 'shared_strings': 'disk'},
+       )
+
+  The string table is de-duplicated in a temporary SQLite database under the
+  ``tmpdir`` (or the system temp directory). Plain strings de-duplicate by
+  text; rich strings de-duplicate by their ordered text fragments and their
+  effective character formats. The temporary database is removed when the
+  workbook is closed.
+
+  This option requires ``constant_memory`` to be ``True`` and ``in_memory``
+  to be ``False``; any other combination raises a ``ValueError`` before any
+  temporary files are created. Without this option the default in-line string
+  behavior is unchanged.
+
+  The flushed cell values are also recorded in the same database so that
+  chart data caches can be populated for rows that have already been written
+  to disk.
+
 * **tmpdir**: ``XlsxWriter`` stores workbook data in temporary files prior
   to assembling the final XLSX file. The temporary files are created in the
   system's temp directory. If the default temporary directory isn't accessible

@@ -302,7 +302,7 @@ class Packager:
         sst = SharedStrings()
         sst.string_table = self.workbook.str_table
 
-        if not self.workbook.str_table.count:
+        if not self.workbook.str_table._has_shared_strings():
             return
 
         sst._set_xml_writer(self._filename("xl/sharedStrings.xml"))
@@ -471,7 +471,7 @@ class Packager:
             content._add_comment_name("comments" + str(i))
 
         # Add the sharedString rel if there is string data in the workbook.
-        if self.workbook.str_table.count:
+        if self.workbook.str_table._has_shared_strings():
             content._add_shared_strings()
 
         # Add vbaProject (and optionally vbaProjectSignature) if present.
@@ -600,7 +600,7 @@ class Packager:
         rels._add_document_relationship("/styles", "styles.xml")
 
         # Add the sharedString rel if there is string data in the workbook.
-        if self.workbook.str_table.count:
+        if self.workbook.str_table._has_shared_strings():
             rels._add_document_relationship("/sharedStrings", "sharedStrings.xml")
 
         # Add vbaProject if present.

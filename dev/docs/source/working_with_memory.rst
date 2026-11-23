@@ -39,6 +39,21 @@ aren't stored in an Excel structure call "shared strings" and instead are
 written "in-line". This is a documented Excel feature that is supported by
 most spreadsheet applications.
 
+If a receiving application needs the standard ``sharedStrings.xml`` table you
+can keep it while still using ``constant_memory`` by adding the
+``'shared_strings': 'disk'`` option::
+
+    workbook = xlsxwriter.Workbook(
+        filename,
+        {'constant_memory': True, 'shared_strings': 'disk'},
+    )
+
+In this mode strings are de-duplicated in a temporary SQLite database in the
+``tmpdir`` and the shared string table is streamed back out when the workbook
+is closed. Peak memory stays bounded regardless of the number of distinct
+strings. The same database records the flushed cell values so that chart data
+caches remain correct for rows that have already been written to disk.
+
 The trade-off when using ``'constant_memory'`` mode is that you won't be able
 to take advantage of any new features that manipulate cell data after it is
 written. Currently the :func:`add_table()` method doesn't work in this mode

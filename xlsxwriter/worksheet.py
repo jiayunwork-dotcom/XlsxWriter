@@ -37,6 +37,16 @@ from .drawing import Drawing, DrawingInfo, DrawingTypes
 from .exceptions import DuplicateTableName, OverlappingRange
 from .format import Format
 from .shape import Shape
+from .sharedstrings import (
+    CELL_BLANK,
+    CELL_BOOLEAN,
+    CELL_ERROR,
+    CELL_FORMULA,
+    CELL_NUMBER,
+    CELL_RICH_STRING,
+    CELL_STRING,
+    STRING_RICH,
+)
 from .utility import (
     _datetime_to_excel_datetime,
     _get_sparkline_style,
@@ -223,6 +233,7 @@ class Worksheet(xmlwriter.XMLwriter):
         self.str_table = None
         self.palette = None
         self.constant_memory = 0
+        self._disk_shared_strings = False
         self.tmpdir = None
         self.is_chartsheet = False
 
@@ -611,6 +622,9 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Write a shared string or an in-line string in constant_memory mode.
         if not self.constant_memory:
+            string_index = self.str_table._get_shared_string_index(string)
+        elif self._disk_shared_strings:
+            # Store the string in the workbook wide disk backed SST.
             string_index = self.str_table._get_shared_string_index(string)
         else:
             string_index = string
@@ -1474,6 +1488,13 @@ class Worksheet(xmlwriter.XMLwriter):
         # Write a shared string or an in-line string in constant_memory mode.
         if not self.constant_memory:
             string_index = self.str_table._get_shared_string_index(string)
+        elif self._disk_shared_strings:
+            # Store the rich string in the workbook wide disk backed SST.
+            # The raw unformatted text is stored separately as the display
+            # value used by chart caches.
+            string_index = self.str_table._get_shared_string_index(
+                string, kind=STRING_RICH, display=raw_string
+            )
         else:
             string_index = string
 
@@ -4830,6 +4851,7 @@ class Worksheet(xmlwriter.XMLwriter):
         self.str_table = init_data["str_table"]
         self.worksheet_meta = init_data["worksheet_meta"]
         self.constant_memory = init_data["constant_memory"]
+        self._disk_shared_strings = init_data.get("disk_shared_strings", False)
         self.tmpdir = init_data["tmpdir"]
         self.date_1904 = init_data["date_1904"]
         self.strings_to_numbers = init_data["strings_to_numbers"]
@@ -5880,8 +5902,11 @@ class Worksheet(xmlwriter.XMLwriter):
         # in the workbook. Return None for data that doesn't exist since
         # Excel can chart series with data missing.
 
-        if self.constant_memory:
+        if self.constant_memory and not self._disk_shared_strings:
             return ()
+
+        if self.constant_memory and self._disk_shared_strings:
+            return self._get_disk_range_data(row_start, col_start, row_end, col_end)
 
         data = []
 
@@ -5926,6 +5951,163 @@ class Worksheet(xmlwriter.XMLwriter):
                     data.append(None)
 
         return data
+
+    def _get_disk_range_data(self, row_start, col_start, row_end, col_end):
+        # Return a range of data for chart caches from the disk backed cell
+        # records and the as-yet unflushed in-memory row. Only the cells in
+        # the requested range are read, so the worksheet as a whole is never
+        # loaded into memory.
+
+        # Collect the flushed cell records for the range in a single query.
+        # String kinds are joined to the SST to return their display text.
+        records = {}
+        flushed_rows = set()
+        if self._disk_shared_strings and self.str_table is not None:
+            cursor = self.str_table._get_range_cells(
+                self.index, row_start, col_start, row_end, col_end
+            )
+            for row_num, col_num, kind, value, sidx, display in cursor:
+                if kind in (CELL_STRING, CELL_RICH_STRING):
+                    # Resolve the string identity through the SST so the
+                    # chart cache and sharedStrings.xml agree.
+                    value = display
+                records[(row_num, col_num)] = (kind, value)
+                flushed_rows.add(row_num)
+
+            # A row exists for the purposes of the in-memory lookup if it had
+            # any cell at all, not just cells within the requested columns.
+            # Ask for the row existence without the column restriction.
+            flushed_rows |= self.str_table._get_range_rows(
+                self.index, row_start, row_end
+            )
+
+        # Overlay the current in-memory row (constant_memory keeps at most
+        # one row of cells in memory). These haven't been flushed yet.
+        for row_num, row_data in self.table.items():
+            if row_start <= row_num <= row_end:
+                # The row exists even if it has no cells in the requested
+                # column range.
+                flushed_rows.add(row_num)
+                for col_num, cell in row_data.items():
+                    if col_start <= col_num <= col_end:
+                        records[(row_num, col_num)] = self._cell_chart_record(cell)
+
+        data = []
+        for row_num in range(row_start, row_end + 1):
+            if row_num not in flushed_rows:
+                # Match the in-memory path: one None for a row that doesn't
+                # exist at all.
+                data.append(None)
+                continue
+
+            for col_num in range(col_start, col_end + 1):
+                record = records.get((row_num, col_num))
+                if record is None:
+                    # Missing column in an existing row.
+                    data.append(None)
+                    continue
+
+                kind, value = record
+
+                if kind in (CELL_BOOLEAN, CELL_ERROR):
+                    # Match the in-memory chart data path which doesn't emit
+                    # an entry for boolean/error cells.
+                    continue
+
+                if kind == CELL_FORMULA and value is None:
+                    # Match the in-memory path: formula values of None
+                    # become 0.
+                    value = 0
+
+                data.append(value)
+
+        return data
+
+    def _cell_chart_record(self, cell):
+        # Convert an in-memory cell into the (kind, value) chart record used
+        # by _get_disk_range_data().
+        cell_type = cell.__class__.__name__
+
+        if cell_type in ("Number", "Datetime"):
+            return (CELL_NUMBER, f"{cell.number:.16g}")
+
+        if cell_type == "String":
+            return (CELL_STRING, self.str_table._get_shared_string(cell.string))
+
+        if cell_type == "RichString":
+            return (CELL_RICH_STRING, cell.raw_string)
+
+        if cell_type in ("Formula", "ArrayFormula"):
+            return (CELL_FORMULA, cell.value)
+
+        if cell_type == "Blank":
+            return (CELL_BLANK, "")
+
+        if cell_type == "Boolean":
+            return (CELL_BOOLEAN, "TRUE" if cell.boolean else "FALSE")
+
+        if cell_type == "Error":
+            return (CELL_ERROR, cell.error)
+
+        return (CELL_BLANK, "")
+
+    def _record_flushed_row(self, row_num) -> None:
+        # Persist the cells of a row that is about to be discarded from the
+        # in-memory table. This is what allows chart range lookups after the
+        # row has been flushed. Only the final value of each cell is stored,
+        # so cells overwritten before the flush don't create records.
+        if not (self.constant_memory and self._disk_shared_strings):
+            return
+
+        row_data = self.table.get(row_num)
+        if not row_data:
+            return
+
+        sheet = self.index
+        records = []
+        for col_num, cell in row_data.items():
+            cell_type = cell.__class__.__name__
+
+            if cell_type in ("Number", "Datetime"):
+                records.append(
+                    (
+                        sheet,
+                        row_num,
+                        col_num,
+                        CELL_NUMBER,
+                        f"{cell.number:.16g}",
+                        None,
+                    )
+                )
+            elif cell_type == "String":
+                records.append(
+                    (sheet, row_num, col_num, CELL_STRING, None, cell.string)
+                )
+            elif cell_type == "RichString":
+                records.append(
+                    (sheet, row_num, col_num, CELL_RICH_STRING, None, cell.string)
+                )
+            elif cell_type in ("Formula", "ArrayFormula"):
+                value = cell.value
+                if value is not None and not isinstance(value, str):
+                    value = str(value)
+                records.append((sheet, row_num, col_num, CELL_FORMULA, value, None))
+            elif cell_type == "Blank":
+                records.append((sheet, row_num, col_num, CELL_BLANK, "", None))
+            elif cell_type == "Boolean":
+                records.append(
+                    (
+                        sheet,
+                        row_num,
+                        col_num,
+                        CELL_BOOLEAN,
+                        "TRUE" if cell.boolean else "FALSE",
+                        None,
+                    )
+                )
+
+        if records:
+            self.str_table._record_cells(records)
 
     def _csv_join(self, *items):
         # Create a csv string for use with data validation formulas and lists.
@@ -6067,6 +6249,24 @@ class Worksheet(xmlwriter.XMLwriter):
         if not self.row_data_fh_closed:
             self.row_data_fh.close()
             self.row_data_fh_closed = True
+
+    def _cleanup_temp_files(self) -> None:
+        # Close and remove the constant_memory row data temp file. Safe to
+        # call more than once, and on sheets without a temp file.
+        if self.row_data_fh is not None and not self.row_data_fh_closed:
+            try:
+                self.row_data_fh.close()
+            except OSError:
+                pass
+            self.row_data_fh_closed = True
+
+        filename = self.row_data_filename
+        if filename and os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+        self.row_data_filename = None
 
     def _opt_reopen(self) -> None:
         # Reopen the row data filehandle in constant_memory mode.
@@ -6654,6 +6854,11 @@ class Worksheet(xmlwriter.XMLwriter):
                 self._write_empty_row(row_num, span, self.set_rows[row_num])
 
         # Reset table.
+        if row_num in self.table and self._disk_shared_strings:
+            # Persist the flushed cells so chart range lookups can still see
+            # them after the row is dropped from memory.
+            self._record_flushed_row(row_num)
+
         self.table.clear()
 
     def _calculate_spans(self) -> None:
@@ -6792,6 +6997,9 @@ class Worksheet(xmlwriter.XMLwriter):
 
             if not self.constant_memory:
                 # Write a shared string.
+                self._xml_string_element(string, attributes)
+            elif self._disk_shared_strings:
+                # Write a shared string from the workbook wide disk store.
                 self._xml_string_element(string, attributes)
             else:
                 # Write an optimized in-line string.
