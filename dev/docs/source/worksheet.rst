@@ -2504,6 +2504,93 @@ don't match the filter condition. See :ref:`working_with_autofilters` for more
 details.
 
 
+worksheet.materialize_autofilter()
+----------------------------------
+
+.. py:function:: materialize_autofilter()
+
+   Apply the worksheet's final autofilter conditions at close time.
+
+   :param: None.
+   :returns: Nothing.
+
+The :func:`autofilter()`, :func:`filter_column()` and
+:func:`filter_column_list()` methods only write filter metadata into the
+XLSX file. By default the caller is responsible for hiding any non-matching
+rows, as described in :ref:`working_with_autofilters`.
+
+Calling ``materialize_autofilter()`` on a worksheet asks XlsxWriter to
+evaluate the final filter conditions while the workbook is being closed and
+hide the data rows that don't match::
+
+    workbook = xlsxwriter.Workbook(
+        'report.xlsx',
+        {'constant_memory': True, 'shared_strings': 'disk'},
+    )
+    worksheet = workbook.add_worksheet()
+    worksheet.autofilter(0, 0, row_count, 2)
+    worksheet.filter_column('A', 'x == East')
+    worksheet.filter_column('C', 'x > 100 and x <= 5000')
+    worksheet.materialize_autofilter()
+
+    for row in data:
+        worksheet.write_row(row, 0, row_data)
+
+    workbook.close()
+
+The method takes no arguments and returns nothing. The filter conditions that
+are in effect when the workbook closes are the ones that are applied, so the
+method can be called before or after writing the rows and the conditions can
+still be added, changed or replaced afterwards. Calling it more than once is
+idempotent.
+
+Only the following conditions are evaluated:
+
+* list members, which are combined with OR,
+* one or two custom comparisons joined by ``and``/``or``,
+* different columns, which are combined with AND,
+* the six numeric comparisons (``==``, ``!=``, ``<``, ``<=``, ``>``, ``>=``)
+  against a finite numeric threshold,
+* case insensitive text ``==``/``!=``, list membership, and the ``*``, ``?``
+  and ``~`` wildcard syntax in custom equality. List members are compared
+  literally.
+
+``== Blanks`` and ``!= Blanks`` are supported. A missing cell, a formatted
+blank and an empty string are all treated as blank. A numeric ``0`` is not
+blank, and the text ``"12"`` doesn't equal the number ``12``. Ordinary
+comparisons never match a blank or a cell of an incompatible type.
+
+Support is currently limited to workbooks created with
+``{'constant_memory': True, 'shared_strings': 'disk'}``. Calling the method on
+any other workbook raises ``ValueError``, as does closing the workbook if a
+filtered column contains a formula, boolean or error cell, or if a condition
+falls outside the supported subset. This is deliberate: a partially filtered
+file is never produced.
+
+The header row and rows outside the autofilter range are never evaluated.
+Every physical row in the data range participates, including rows that were
+never written, which are treated as blank. The cell contents and coordinates
+are unchanged; only the ``hidden`` attribute is added to non-matching rows.
+Rows that were already hidden by :func:`set_row()` stay hidden even if they
+match. Row heights, formats, outline levels and collapsed state are preserved.
+
+When charts reference a filtered worksheet range they use the same final
+visibility as the row XML: a chart that plots only visible data drops the
+hidden points from its cache while keeping ``ptCount`` at the original range
+length and the remaining ``pt`` indices at their original positions. A chart
+created with ``show_hidden_data()`` keeps every point. A series with explicit
+``categories_data`` or ``values_data`` is not affected. Two charts that
+reference the same range share the cached values but not the visibility
+mode, so their creation order doesn't matter.
+
+The implementation streams the flushed cell records from the disk backed
+store in one ordered pass and persists the hidden row numbers in that store.
+The memory cost is independent of the number of rows, the cost of a late or
+replaced condition is the same as setting it last, and a sparse match costs
+one sequential scan plus one stored row per hidden data row. The
+``dev/autofilter`` experiment contains the measurements.
+
+
 worksheet.set_selection()
 -------------------------
 .. py:function:: set_selection(first_row, first_col, last_row, last_col)

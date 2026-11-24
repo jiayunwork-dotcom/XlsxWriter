@@ -59,6 +59,30 @@ to take advantage of any new features that manipulate cell data after it is
 written. Currently the :func:`add_table()` method doesn't work in this mode
 and :func:`merge_range()` and :func:`set_row()` only work for the current row.
 
+One feature that does work with the disk backed mode is the materialized
+autofilter. Calling :func:`materialize_autofilter()` hides the non-matching
+rows at close time, so the caller doesn't need to iterate the data and call
+:func:`set_row()` for every row::
+
+    workbook = xlsxwriter.Workbook(
+        filename,
+        {'constant_memory': True, 'shared_strings': 'disk'},
+    )
+    worksheet = workbook.add_worksheet()
+    worksheet.autofilter('A1:D51')
+    worksheet.filter_column('A', 'Region == East')
+    worksheet.materialize_autofilter()
+
+    for row in data:
+        worksheet.write_row(row, 0, row_data)
+
+The matching is streamed from the same SQLite store that holds the flushed
+cells, so peak memory stays flat. The decisions are written to that store and
+reused by the worksheet XML writer and the chart cache builder, so charts
+that reference the range see exactly the rows that the file hides. See
+:ref:`working_with_autofilters` for the supported conditions and the
+``dev/autofilter`` experiment for the resource measurements.
+
 
 Performance Figures
 -------------------

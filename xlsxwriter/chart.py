@@ -3620,6 +3620,13 @@ class Chart(xmlwriter.XMLwriter):
         else:
             count = 0
 
+        # Points whose source row was hidden by a materialized autofilter are
+        # omitted, but their positions still count towards ptCount and the
+        # idx of the remaining points. A chart that plots hidden data keeps
+        # every point, even when it shares the same cached range object with
+        # a chart that doesn't.
+        hidden = None if self.show_hidden else getattr(data, "hidden_indices", None)
+
         self._xml_start_tag("c:numCache")
 
         # Write the c:formatCode element.
@@ -3629,6 +3636,9 @@ class Chart(xmlwriter.XMLwriter):
         self._write_pt_count(count)
 
         for i in range(count):
+            if hidden and i in hidden:
+                continue
+
             token = data[i]
 
             if token is None:
@@ -3649,12 +3659,17 @@ class Chart(xmlwriter.XMLwriter):
         # Write the <c:strCache> element.
         count = len(data)
 
+        hidden = None if self.show_hidden else getattr(data, "hidden_indices", None)
+
         self._xml_start_tag("c:strCache")
 
         # Write the c:ptCount element.
         self._write_pt_count(count)
 
         for i in range(count):
+            if hidden and i in hidden:
+                continue
+
             # Write the c:pt element.
             self._write_pt(i, data[i])
 

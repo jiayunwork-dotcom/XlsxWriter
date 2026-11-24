@@ -245,6 +245,22 @@ class DiskSharedStringTable:
             "sidx INTEGER, "
             "PRIMARY KEY (sheet, row, col)) WITHOUT ROWID"
         )
+        self.db.execute(
+            "CREATE TABLE filter_hidden ("
+            "sheet INTEGER NOT NULL, "
+            "row INTEGER NOT NULL, "
+            "PRIMARY KEY (sheet, row)) WITHOUT ROWID"
+        )
+        # Error cells aren't part of the chart cache cell records, but a
+        # materialized autofilter must refuse to filter over them. They are
+        # rare, so recording them separately keeps the chart path unchanged.
+        self.db.execute(
+            "CREATE TABLE filter_errors ("
+            "sheet INTEGER NOT NULL, "
+            "row INTEGER NOT NULL, "
+            "col INTEGER NOT NULL, "
+            "PRIMARY KEY (sheet, row, col)) WITHOUT ROWID"
+        )
 
     ###########################################################################
     #
@@ -387,6 +403,102 @@ class DiskSharedStringTable:
         # emits a single None for a row that doesn't exist at all.
         cursor = self.db.execute(
             "SELECT DISTINCT row FROM cells "
+            "WHERE sheet = ? AND row BETWEEN ? AND ?",
+            (sheet, row_start, row_end),
+        )
+        return {row[0] for row in cursor}
+
+    def _record_error_cells(self, records):
+        # Store the positions of flushed error cells for filter validation.
+        self.db.executemany(
+            "INSERT OR REPLACE INTO filter_errors (sheet, row, col) "
+            "VALUES (?, ?, ?)",
+            records,
+        )
+
+    def _first_filter_error(self, sheet, row_start, row_end, columns):
+        # Return the first error cell in the given columns/rows, if any.
+        if not columns:
+            return None
+        placeholders = ",".join("?" for _ in columns)
+        params = [sheet, row_start, row_end]
+        params.extend(sorted(columns))
+        return self.db.execute(
+            "SELECT row, col FROM filter_errors "
+            f"WHERE sheet = ? AND row BETWEEN ? AND ? "
+            f"  AND col IN ({placeholders}) ORDER BY row, col LIMIT 1",
+            params,
+        ).fetchone()
+
+    def _get_filter_column_cells(self, sheet, row_start, row_end, columns):
+        # Return an ordered cursor over the flushed cells in the given
+        # columns. Only the cells that can affect an autofilter decision are
+        # read, and the caller streams the rows in ascending order. String
+        # display text is resolved through the shared string table so rich
+        # strings and plain strings compare by what is shown.
+        if not columns:
+            return iter(())
+
+        placeholders = ",".join("?" for _ in columns)
+        params = [sheet, row_start, row_end]
+        params.extend(sorted(columns))
+        return self.db.execute(
+            "SELECT c.row, c.col, c.kind, c.value, c.sidx, "
+            "       COALESCE(s.display, s.payload) "
+            "FROM cells c LEFT JOIN strings s ON s.idx = c.sidx "
+            f"WHERE c.sheet = ? AND c.row BETWEEN ? AND ? "
+            f"  AND c.col IN ({placeholders}) "
+            "ORDER BY c.row, c.col",
+            params,
+        )
+
+    def _clear_hidden_rows(self, sheet):
+        # Remove any previous materialized decisions for a sheet. This makes
+        # a repeated close (for example after a failure) start from scratch.
+        self.db.execute("DELETE FROM filter_hidden WHERE sheet = ?", (sheet,))
+
+    def _insert_hidden_rows(self, rows):
+        # Insert a batch of (sheet, row) hidden decisions. The caller manages
+        # the transaction so an entire sheet's decisions are one disk sync
+        # while large decision sets are still written batch by batch.
+        self.db.executemany(
+            "INSERT OR REPLACE INTO filter_hidden (sheet, row) VALUES (?, ?)",
+            rows,
+        )
+
+    def _begin_hidden_transaction(self):
+        # Use an immediate transaction so the poll of unsupported cells and
+        # the decision writes see a consistent database.
+        self.db.execute("BEGIN IMMEDIATE")
+
+    def _commit_hidden_transaction(self):
+        self.db.execute("COMMIT")
+
+    def _rollback_hidden_transaction(self):
+        try:
+            self.db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    def _iter_hidden_rows(self, sheet, row_start, row_end):
+        # Yield the hidden row numbers for a sheet in ascending order. Used
+        # by the streaming worksheet writer so it can merge them with the row
+        # data file without loading either side into memory.
+        cursor = self.db.execute(
+            "SELECT row FROM filter_hidden "
+            "WHERE sheet = ? AND row BETWEEN ? AND ? ORDER BY row",
+            (sheet, row_start, row_end),
+        )
+        cursor.arraysize = 256
+        for (row,) in cursor:
+            yield row
+
+    def _get_hidden_rows(self, sheet, row_start, row_end):
+        # Return the hidden rows in a range as a set. Only chart ranges use
+        # this, and a chart's cache is already limited to the ranges it
+        # actually references.
+        cursor = self.db.execute(
+            "SELECT row FROM filter_hidden "
             "WHERE sheet = ? AND row BETWEEN ? AND ?",
             (sheet, row_start, row_end),
         )

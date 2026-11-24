@@ -73,6 +73,46 @@ autofilter criteria::
         row += 1
 
 
+Materializing the filter
+------------------------
+
+For very large data sets it is inconvenient (and in ``constant_memory`` mode
+often impossible) to keep the source data around in order to hide the rows.
+In the disk backed ``constant_memory`` export path XlsxWriter can apply the
+final filter itself. Call :func:`materialize_autofilter()` on the worksheet
+and the matching is done while the workbook is closed::
+
+    workbook = xlsxwriter.Workbook(
+        'report.xlsx',
+        {'constant_memory': True, 'shared_strings': 'disk'},
+    )
+    worksheet = workbook.add_worksheet()
+
+    worksheet.autofilter('A1:D51')
+    worksheet.write_row('A1', headers)
+
+    for row in data:
+        worksheet.write_row(row, 0, row_data)
+
+    # Conditions can be set before or after the data is written.
+    worksheet.filter_column('A', 'Region == East')
+    worksheet.filter_column('C', 'x > 1000 and x <= 8000')
+    worksheet.materialize_autofilter()
+
+    workbook.close()
+
+The conditions that are in effect when the workbook is closed are the ones
+that are applied, so it is also possible to replace a condition after calling
+``materialize_autofilter()``. Rows that were already hidden by
+:func:`set_row()` stay hidden. Charts that reference the filtered range use
+the same visibility: a chart that plots only visible data omits the hidden
+points from its cached data, while a chart created with
+``show_hidden_data()`` keeps them.
+
+See :func:`materialize_autofilter` for the supported subset of conditions and
+the current ``constant_memory``/``shared_strings='disk'`` requirement.
+
+
 Setting a filter criteria for a column
 --------------------------------------
 

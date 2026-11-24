@@ -786,6 +786,11 @@ class Workbook(xmlwriter.XMLwriter):
         if getattr(self.str_table, "failed", False):
             raise IOError("The disk backed shared string store failed.")
 
+        # Materialize any requested autofilters before any output file is
+        # created. An unsupported filter or cell type therefore fails without
+        # leaving a temp or partial output file behind.
+        self._prepare_materialized_filters()
+
         # Create the xlsx/zip file.
         # In disk backed shared string mode, write to a temporary file in the
         # same directory and move it into place only on success. This ensures
@@ -1601,6 +1606,14 @@ class Workbook(xmlwriter.XMLwriter):
             if sheet.has_dynamic_arrays:
                 self.has_metadata = True
                 self.has_dynamic_functions = True
+
+    def _prepare_materialized_filters(self) -> None:
+        # Apply Worksheet.materialize_autofilter() requests. The evaluation is
+        # streamed from the disk backed cell store so no worksheet data is
+        # accumulated in memory, and the decisions are persisted in that store
+        # for the XML writer and the chart cache builder to share.
+        for worksheet in self.worksheets():
+            worksheet._prepare_materialized_filter()
 
     def _add_chart_data(self) -> None:
         # Add "cached" data to charts to provide the numCache and strCache

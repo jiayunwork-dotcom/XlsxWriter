@@ -33,6 +33,13 @@ from xlsxwriter.vml import ButtonType
 
 # Package imports.
 from . import xmlwriter
+from .autofilter import (
+    FilteredSeriesData,
+    filter_value_from_record,
+    check_cell_kind,
+    compile_filter_plan,
+    row_matches,
+)
 from .drawing import Drawing, DrawingInfo, DrawingTypes
 from .exceptions import DuplicateTableName, OverlappingRange
 from .format import Format
@@ -202,6 +209,37 @@ CellArrayFormulaTuple = namedtuple(
     "ArrayFormula", "formula, format, value, range, atype"
 )
 
+# Map in-memory cell class names to the cell kinds shared with the disk store.
+_FILTER_CELL_KINDS = {
+    "Number": CELL_NUMBER,
+    "Datetime": CELL_NUMBER,
+    "String": CELL_STRING,
+    "RichString": CELL_RICH_STRING,
+    "Formula": CELL_FORMULA,
+    "ArrayFormula": CELL_FORMULA,
+    "Boolean": CELL_BOOLEAN,
+    "Error": CELL_ERROR,
+    "Blank": CELL_BLANK,
+}
+
+
+def _row_number_from_tag(tag):
+    # Extract the 1-based row number from a cached <row r=".."> start tag.
+    match = re.search(r' r="(\d+)"', tag)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _tag_with_hidden(tag):
+    # Insert a hidden="1" attribute into an <row> start tag. The cached row
+    # tags are written by _write_row() with unencoded attributes, so the
+    # insertion is a simple string edit between "r" and the next attribute.
+    end = len(tag) - 1
+    if tag.endswith("/>"):
+        end -= 1
+    return tag[:end] + ' hidden="1"' + tag[end:]
+
 
 ###############################################################################
 #
@@ -357,10 +395,19 @@ class Worksheet(xmlwriter.XMLwriter):
         self.autofilter_area = ""
         self.autofilter_ref = None
         self.filter_range = [0, 9]
+        self.filter_row_range = [0, 0]
         self.filter_on = 0
         self.filter_cols = {}
         self.filter_type = {}
+        self.filter_equality_cols = set()
         self.filter_cells = {}
+
+        # Materialized autofilter state (see materialize_autofilter()).
+        self._materialize_filter = False
+        self._filter_active = False
+        self._filter_data_start = 0
+        self._filter_data_end = 0
+        self._filter_hidden_count = 0
 
         self.row_sizes = {}
         self.col_size_changed = False
@@ -2466,6 +2513,8 @@ class Worksheet(xmlwriter.XMLwriter):
 
             self.filter_cells[(first_row, col)] = ("worksheet", ref)
 
+        self.filter_row_range = [first_row, last_row]
+
     def filter_column(self, col: int, criteria: str) -> None:
         """
         Set the column filter criteria.
@@ -2516,13 +2565,16 @@ class Worksheet(xmlwriter.XMLwriter):
         if len(tokens) == 2 and tokens[0] == 2:
             # Single equality.
             self.filter_column_list(col, [tokens[1]])
+            self.filter_equality_cols.add(col)
         elif len(tokens) == 5 and tokens[0] == 2 and tokens[2] == 1 and tokens[3] == 2:
             # Double equality with "or" operator.
             self.filter_column_list(col, [tokens[1], tokens[4]])
+            self.filter_equality_cols.add(col)
         else:
             # Non default custom filter.
             self.filter_cols[col] = tokens
             self.filter_type[col] = 0
+            self.filter_equality_cols.discard(col)
 
         self.filter_on = 1
 
@@ -2566,7 +2618,44 @@ class Worksheet(xmlwriter.XMLwriter):
 
         self.filter_cols[col] = filters
         self.filter_type[col] = 1
+        # A direct list filter compares list text literally. filter_column()
+        # re-adds the column when it routes an equality expression here.
+        self.filter_equality_cols.discard(col)
         self.filter_on = 1
+
+    def materialize_autofilter(self) -> None:
+        """
+        Apply the worksheet's autofilter conditions when the workbook closes.
+
+        By default, :func:`autofilter()` only writes filter metadata to the
+        file; the caller is responsible for hiding non-matching rows with
+        :func:`set_row()`. Calling this method asks XlsxWriter to evaluate the
+        final filter conditions at close time and hide the data rows that
+        don't match, so that a viewer (and chart caches) sees the filtered
+        result without the caller iterating the data.
+
+        The method takes no arguments and returns nothing. It can be called
+        before or after the rows are written; the conditions that are in
+        effect when the workbook closes are the ones that are applied, so the
+        filters can still be added or replaced afterwards. Repeated calls are
+        idempotent.
+
+        Only ``constant_memory=True`` workbooks with
+        ``shared_strings='disk'`` are supported. Other workbooks raise
+        ``ValueError``. Only the following conditions are evaluated: list
+        members (OR), one or two custom comparisons joined by ``and``/``or``,
+        different columns combined with ``and``, the six numeric comparisons
+        against a finite numeric threshold, and case insensitive text equality,
+        inequality and list membership (with ``*``, ``?`` and ``~`` wildcards
+        in custom equality). ``== Blanks``/``!= Blanks`` are supported.
+        """
+        if not (self.constant_memory and self._disk_shared_strings):
+            raise ValueError(
+                "materialize_autofilter() requires a Workbook created with "
+                "'constant_memory': True and shared_strings='disk'."
+            )
+
+        self._materialize_filter = True
 
     @convert_range_args
     def data_validation(
@@ -5896,6 +5985,159 @@ class Worksheet(xmlwriter.XMLwriter):
 
         sparkline[user_color] = Color._from_value(options[user_color])
 
+    ###########################################################################
+    #
+    # Materialized autofilter handling.
+    #
+    ###########################################################################
+    def _prepare_materialized_filter(self) -> None:
+        # Compile the final autofilter conditions and persist the set of rows
+        # that they hide. This runs before the worksheet XML is written and
+        # before the chart caches are built, so both read the same decisions.
+        if not self._materialize_filter:
+            return
+
+        if not (self.constant_memory and self._disk_shared_strings):
+            raise ValueError(
+                "materialize_autofilter() requires a Workbook created with "
+                "'constant_memory': True and shared_strings='disk'."
+            )
+
+        self._filter_active = False
+
+        if not self.autofilter_ref or not self.filter_cols:
+            return
+
+        (col_first, col_last) = self.filter_range
+        (first_row, last_row) = self.filter_row_range
+        data_start = first_row + 1
+        data_end = last_row
+
+        plan = compile_filter_plan(
+            self.filter_cols,
+            self.filter_type,
+            self.filter_equality_cols,
+            col_first,
+            col_last,
+        )
+        if not plan:
+            return
+
+        overlay = self._unflushed_filter_values(plan, data_start, data_end)
+
+        # Persist the decisions before the XML is written. A failure part
+        # way through the evaluation (for example an unsupported cell in a
+        # filtered column) rolls the decisions back and propagates, so a
+        # partially filtered workbook is never produced.
+        hidden_count = 0
+        self.str_table._begin_hidden_transaction()
+        try:
+            self.str_table._clear_hidden_rows(self.index)
+            batch = []
+            for row_num in self._iter_filter_hidden_rows(
+                plan, data_start, data_end, overlay
+            ):
+                hidden_count += 1
+                batch.append((self.index, row_num))
+                if len(batch) >= 1000:
+                    self.str_table._insert_hidden_rows(batch)
+                    batch = []
+            if batch:
+                self.str_table._insert_hidden_rows(batch)
+            self.str_table._commit_hidden_transaction()
+        except Exception:
+            self.str_table._rollback_hidden_transaction()
+            raise
+
+        self._filter_data_start = data_start
+        self._filter_data_end = data_end
+        self._filter_hidden_count = hidden_count
+        self._filter_active = hidden_count > 0
+
+    def _unflushed_filter_values(self, plan, data_start, data_end):
+        # Collect the filter column values of any data rows still buffered in
+        # memory when close() starts. In constant_memory mode that is at most
+        # the final row, but the loop also covers sheets where one row was
+        # kept without advancing. Only the filter columns are inspected.
+        overlay = {}
+
+        for row_num, row_data in self.table.items():
+            if row_num < data_start or row_num > data_end:
+                continue
+            for col in plan:
+                cell = row_data.get(col)
+                if cell is not None:
+                    overlay[(row_num, col)] = self._filter_cell_value(
+                        cell, col, row_num
+                    )
+
+        return overlay
+
+    def _filter_cell_value(self, cell, col, row_num):
+        # Convert an in-memory cell into the comparison value used by the
+        # filter plan. Formula, boolean and error cells are rejected because
+        # a filter can't be evaluated without calculating the workbook.
+        kind = _FILTER_CELL_KINDS.get(cell.__class__.__name__)
+        col_name = xl_col_to_name(col) or str(col)
+
+        if kind is None:
+            return ("blank", None)
+
+        check_cell_kind(kind, self.name, row_num, col_name)
+
+        if kind == CELL_NUMBER:
+            return ("num", float(cell.number))
+        if kind == CELL_STRING:
+            text = self.str_table._get_shared_string(cell.string)
+            return ("str", text) if text else ("blank", None)
+        if kind == CELL_RICH_STRING:
+            text = cell.raw_string
+            return ("str", text) if text else ("blank", None)
+        return ("blank", None)
+
+    def _iter_filter_hidden_rows(self, plan, data_start, data_end, overlay):
+        # Stream every physical row in the filter range and yield the rows
+        # that don't match. The flushed cells are read with one ordered
+        # cursor, so only one row of values is held at a time and the memory
+        # cost is independent of the number of data rows. Rows that were
+        # never written are evaluated as all-blank. Cells of an unsupported
+        # type in a filtered column abort the close.
+        columns = sorted(plan)
+
+        error_cell = self.str_table._first_filter_error(
+            self.index, data_start, data_end, columns
+        )
+        if error_cell is not None:
+            row_num, col = error_cell
+            check_cell_kind(
+                CELL_ERROR, self.name, row_num, xl_col_to_name(col)
+            )
+
+        cursor = self.str_table._get_filter_column_cells(
+            self.index, data_start, data_end, columns
+        )
+        record = cursor.fetchone()
+
+        overlay_rows = {}
+        for (row_num, col), value in overlay.items():
+            overlay_rows.setdefault(row_num, {})[col] = value
+
+        for row_num in range(data_start, data_end + 1):
+            values = {}
+
+            while record is not None and record[0] == row_num:
+                _row, col, kind, value, _sidx, display = record
+                check_cell_kind(kind, self.name, row_num, xl_col_to_name(col))
+                values[col] = filter_value_from_record(kind, value, display)
+                record = cursor.fetchone()
+
+            row_overlay = overlay_rows.pop(row_num, None)
+            if row_overlay:
+                values.update(row_overlay)
+
+            if not row_matches(plan, values):
+                yield row_num
+
     def _get_range_data(self, row_start, col_start, row_end, col_end):
         # Returns a range of data from the worksheet _table to be used in
         # chart cached data. Strings are returned as SST ids and decoded
@@ -5993,11 +6235,17 @@ class Worksheet(xmlwriter.XMLwriter):
                         records[(row_num, col_num)] = self._cell_chart_record(cell)
 
         data = []
+        # For each emitted data entry, the source row. Only used to align
+        # chart cache visibility for 1D vertical ranges; the memory cost is
+        # proportional to the chart range, which is already materialized as
+        # the cache itself.
+        data_rows = []
         for row_num in range(row_start, row_end + 1):
             if row_num not in flushed_rows:
                 # Match the in-memory path: one None for a row that doesn't
                 # exist at all.
                 data.append(None)
+                data_rows.append(row_num)
                 continue
 
             for col_num in range(col_start, col_end + 1):
@@ -6005,6 +6253,7 @@ class Worksheet(xmlwriter.XMLwriter):
                 if record is None:
                     # Missing column in an existing row.
                     data.append(None)
+                    data_rows.append(row_num)
                     continue
 
                 kind, value = record
@@ -6020,8 +6269,47 @@ class Worksheet(xmlwriter.XMLwriter):
                     value = 0
 
                 data.append(value)
+                data_rows.append(row_num)
+
+        if self._filter_active:
+            return self._apply_visibility_to_range_data(
+                data, data_rows, row_start, col_start, row_end, col_end
+            )
 
         return data
+
+    def _apply_visibility_to_range_data(
+        self, data, data_rows, row_start, col_start, row_end, col_end
+    ):
+        # Return the chart cache data for a 1D range with the positions of
+        # filtered-out rows marked. Only rows that the autofilter hides are
+        # marked here; rows hidden by other means are left to the chart's own
+        # show_hidden_data() handling.
+        hidden_rows = self._filter_visible_rows(row_start, row_end)
+        if not hidden_rows:
+            return data
+
+        # data_rows maps each cache point to its source row, so a vertical
+        # range maps one point per row while a single-row range maps every
+        # point to that row. Both are handled without positional guessing.
+        hidden_indices = {
+            index
+            for index, row_num in enumerate(data_rows)
+            if row_num in hidden_rows
+        }
+        if not hidden_indices:
+            return data
+
+        return FilteredSeriesData(data, hidden_indices)
+
+    def _filter_visible_rows(self, row_start, row_end):
+        # Return the set of rows in a range that the materialized autofilter
+        # hides. This reads the decisions already persisted by close(), so the
+        # worksheet XML and the chart caches always agree.
+        if not self._filter_active:
+            return set()
+
+        return self.str_table._get_hidden_rows(self.index, row_start, row_end)
 
     def _cell_chart_record(self, cell):
         # Convert an in-memory cell into the (kind, value) chart record used
@@ -6065,6 +6353,7 @@ class Worksheet(xmlwriter.XMLwriter):
 
         sheet = self.index
         records = []
+        error_cells = []
         for col_num, cell in row_data.items():
             cell_type = cell.__class__.__name__
 
@@ -6105,9 +6394,15 @@ class Worksheet(xmlwriter.XMLwriter):
                         None,
                     )
                 )
+            elif cell_type == "Error":
+                # Error cells have no chart cache record but their position is
+                # tracked so a materialized autofilter can reject them.
+                error_cells.append((sheet, row_num, col_num))
 
         if records:
             self.str_table._record_cells(records)
+        if error_cells:
+            self.str_table._record_error_cells(error_cells)
 
     def _csv_join(self, *items):
         # Create a csv string for use with data validation formulas and lists.
@@ -6621,19 +6916,106 @@ class Worksheet(xmlwriter.XMLwriter):
         else:
             self._xml_start_tag("sheetData")
 
-            # Rewind the filehandle that was used for temp row data.
-            buff_size = 65536
-            self.row_data_fh.seek(0)
-            data = self.row_data_fh.read(buff_size)
-
-            while data:
-                self.fh.write(data)
+            if self._filter_active and self._filter_hidden_count:
+                self._write_filtered_row_data()
+            else:
+                # Rewind the filehandle that was used for temp row data.
+                buff_size = 65536
+                self.row_data_fh.seek(0)
                 data = self.row_data_fh.read(buff_size)
+
+                while data:
+                    self.fh.write(data)
+                    data = self.row_data_fh.read(buff_size)
 
             self.row_data_fh.close()
             os.unlink(self.row_data_filename)
 
             self._xml_end_tag("sheetData")
+
+    def _write_filtered_row_data(self) -> None:
+        # Stream the optimized row data into the worksheet XML, adding a
+        # hidden="1" attribute to the rows that the materialized autofilter
+        # hides. Both the row stream and the hidden row list are in ascending
+        # order, so the hidden decisions are merged with a single streaming
+        # pass. The row data isn't held in memory, and neither are all the
+        # decisions: only the current chunk and the next hidden row.
+        hidden_iter = self.str_table._iter_hidden_rows(
+            self.index, self._filter_data_start, self._filter_data_end
+        )
+        next_hidden = next(hidden_iter, None)
+
+        self.row_data_fh.seek(0)
+        buff_size = 65536
+        buffer = ""
+        eof = False
+
+        while True:
+            # Read enough data to contain the next complete row start tag.
+            start = buffer.find("<row ")
+            while start < 0 and not eof:
+                chunk = self.row_data_fh.read(buff_size)
+                if chunk:
+                    buffer += chunk
+                    start = buffer.find("<row ")
+                else:
+                    eof = True
+
+            if start < 0:
+                # No more rows: flush whatever is left.
+                if buffer:
+                    self.fh.write(buffer)
+                    buffer = ""
+                if eof:
+                    break
+                continue
+
+            end = buffer.find(">", start)
+            while end < 0 and not eof:
+                chunk = self.row_data_fh.read(buff_size)
+                if chunk:
+                    buffer += chunk
+                    end = buffer.find(">", start)
+                else:
+                    eof = True
+
+            if end < 0:
+                # Unterminated tag; write the remainder verbatim.
+                self.fh.write(buffer)
+                buffer = ""
+                break
+
+            # Write everything before the row start tag.
+            self.fh.write(buffer[:start])
+            tag = buffer[start : end + 1]
+            buffer = buffer[end + 1 :]
+
+            row_num = _row_number_from_tag(tag)
+            # Hidden decisions are stored zero indexed; cached row tags are
+            # one indexed.
+            if row_num is not None:
+                row_num -= 1
+
+            # Advance the hidden row list to the current row.
+            while (
+                next_hidden is not None
+                and row_num is not None
+                and next_hidden < row_num
+            ):
+                next_hidden = next(hidden_iter, None)
+
+            if (
+                next_hidden is not None
+                and row_num is not None
+                and next_hidden == row_num
+                and "hidden=" not in tag
+            ):
+                tag = _tag_with_hidden(tag)
+                next_hidden = next(hidden_iter, None)
+
+            self.fh.write(tag)
+
+        hidden_iter.close()
 
     def _write_page_margins(self) -> None:
         # Write the <pageMargins> element.
