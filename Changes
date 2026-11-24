@@ -1,4 +1,19 @@
 
+
+Release 3.2.10 - Unreleased
+----------------------------
+
+* Added support for :func:`add_table()` in ``constant_memory`` mode. The table
+  header, calculated column formulas and totals row are generated as each row
+  is flushed, so that memory use stays flat regardless of the number of table
+  rows. The table must start at the current row or a later one, otherwise
+  ``add_table()`` returns ``-3``. Table and merge overlap checks give the same
+  ``OverlappingRange`` errors as in normal mode, in either call order.
+
+  See ``dev/performance/perf_constant_memory_table.py`` for a peak memory
+  measurement script.
+
+
 Release 3.2.9 - September 16 2025
 ---------------------------------
 

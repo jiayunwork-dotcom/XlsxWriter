@@ -2010,7 +2010,8 @@ worksheet.add_table()
    :returns:  0: Success.
    :returns: -1: Row or column is out of worksheet bounds.
    :returns: -2: Incorrect parameter or option.
-   :returns: -3: Not supported in ``constant_memory`` mode.
+   :returns: -3: The table start row has already been flushed in
+               ``constant_memory`` mode.
 
 The ``add_table()`` method is used to group a range of cells into an Excel
 Table::
@@ -2031,8 +2032,11 @@ See also the examples in :ref:`ex_tables`.
 
 .. Note::
 
-   Tables aren't available in XlsxWriter when :func:`Workbook`
-   ``'constant_memory'`` mode is enabled.
+   Tables are supported in :func:`Workbook` ``'constant_memory'`` mode, but
+   the table must start at the current row or a later one, since earlier rows
+   have already been written. The table's header, calculated column and totals
+   cells are generated as each row is flushed, so the memory use stays flat
+   regardless of the number of table rows. See :ref:`memory_perf`.
 
 
 worksheet.add_sparkline()

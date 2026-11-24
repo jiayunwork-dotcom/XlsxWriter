@@ -193,6 +193,13 @@ CellArrayFormulaTuple = namedtuple(
 )
 
 
+def _cm_ranges_overlap(r1, c1, r2, c2, r3, c3, r4, c4) -> bool:
+    # Helper for constant_memory mode. Return True if the rectangle
+    # (r1, c1, r2, c2) intersects the rectangle (r3, c3, r4, c4). The
+    # coordinates are inclusive.
+    return not (r2 < r3 or r4 < r1 or c2 < c3 or c4 < c1)
+
+
 ###############################################################################
 #
 # Worksheet Class definition.
@@ -331,6 +338,15 @@ class Worksheet(xmlwriter.XMLwriter):
         self.merged_cells = {}
         self.table_cells = {}
         self.row_spans = {}
+
+        # In constant_memory mode the per-cell table/merge occupancy maps
+        # above aren't used since they would grow with the table size.
+        # Instead we keep compact range based records and generate the
+        # table cells for each row when that row is flushed. `_cm_tables` is
+        # the single source of truth for table occupancy and for which rows
+        # still need to be flushed.
+        self._cm_tables = []
+        self._cm_merge_ranges = []
 
         self.has_vml = False
         self.has_header_vml = False
@@ -2359,32 +2375,96 @@ class Worksheet(xmlwriter.XMLwriter):
         if first_col > last_col:
             (first_col, last_col) = (last_col, first_col)
 
-        # Check that row and col are valid and store max and min values.
-        if self._check_dimensions(first_row, first_col):
-            return -1
-        if self._check_dimensions(last_row, last_col):
-            return -1
+        # Check that row and col are valid. In constant_memory mode an overlap
+        # should still be reported as OverlappingRange even if the merge
+        # touches an already flushed row, so the row bounds and the dimensions
+        # are recorded only once the range is known to be writable.
+        if self.constant_memory:
+            if self._check_dimensions(first_row, first_col, True, True):
+                return -1
+            if self._check_dimensions(last_row, last_col, True, True):
+                return -1
+        else:
+            if self._check_dimensions(first_row, first_col):
+                return -1
+            if self._check_dimensions(last_row, last_col):
+                return -1
 
         # Check if the merge range overlaps a previous merged or table range.
         # This is a critical file corruption error in Excel.
         cell_range = xl_range(first_row, first_col, last_row, last_col)
-        for row in range(first_row, last_row + 1):
-            for col in range(first_col, last_col + 1):
-                if self.merged_cells.get((row, col)):
-                    previous_range = self.merged_cells.get((row, col))
+
+        if not self.constant_memory:
+            for row in range(first_row, last_row + 1):
+                for col in range(first_col, last_col + 1):
+                    if self.merged_cells.get((row, col)):
+                        previous_range = self.merged_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Merge range '{cell_range}' overlaps previous merge "
+                            f"range '{previous_range}'."
+                        )
+
+                    if self.table_cells.get((row, col)):
+                        previous_range = self.table_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Merge range '{cell_range}' overlaps previous table "
+                            f"range '{previous_range}'."
+                        )
+
+                    self.merged_cells[(row, col)] = cell_range
+        else:
+            # In constant_memory mode the per-cell occupancy maps would grow
+            # with the merge area, so ranges are compared as rectangles.
+            for range_info in self._cm_merge_ranges:
+                if _cm_ranges_overlap(
+                    first_row,
+                    first_col,
+                    last_row,
+                    last_col,
+                    range_info[0],
+                    range_info[1],
+                    range_info[2],
+                    range_info[3],
+                ):
                     raise OverlappingRange(
                         f"Merge range '{cell_range}' overlaps previous merge "
-                        f"range '{previous_range}'."
+                        f"range '{range_info[4]}'."
                     )
 
-                if self.table_cells.get((row, col)):
-                    previous_range = self.table_cells.get((row, col))
+            for table_info in self._cm_tables:
+                if _cm_ranges_overlap(
+                    first_row,
+                    first_col,
+                    last_row,
+                    last_col,
+                    table_info["first_row"],
+                    table_info["first_col"],
+                    table_info["last_row"],
+                    table_info["last_col"],
+                ):
+                    previous_range = xl_range(
+                        table_info["first_row"],
+                        table_info["first_col"],
+                        table_info["last_row"],
+                        table_info["last_col"],
+                    )
                     raise OverlappingRange(
                         f"Merge range '{cell_range}' overlaps previous table "
                         f"range '{previous_range}'."
                     )
 
-                self.merged_cells[(row, col)] = cell_range
+            # Merge only works for rows that haven't been flushed yet, as in
+            # the original constant_memory behaviour.
+            if first_row < self.previous_row:
+                return -1
+
+            # Now that the merge is known to be writable, store the dimensions.
+            self._check_dimensions(first_row, first_col)
+            self._check_dimensions(last_row, last_col)
+
+            self._cm_merge_ranges.append(
+                (first_row, first_col, last_row, last_col, cell_range)
+            )
 
         # Store the merge range.
         self.merge.append([first_row, first_col, last_row, last_col])
@@ -3346,7 +3426,8 @@ class Worksheet(xmlwriter.XMLwriter):
             0:  Success.
             -1: Row or column is out of worksheet bounds.
             -2: Incorrect parameter or option.
-            -3: Not supported in constant_memory mode.
+            -3: The table start row has already been flushed in
+                constant_memory mode.
         """
         table = {}
         col_formats = {}
@@ -3356,10 +3437,6 @@ class Worksheet(xmlwriter.XMLwriter):
         else:
             # Copy the user defined options so they aren't modified.
             options = options.copy()
-
-        if self.constant_memory:
-            warn("add_table() isn't supported in 'constant_memory' mode")
-            return -3
 
         # Check that row and col are valid without storing the values.
         if self._check_dimensions(first_row, first_col, True, True):
@@ -3376,23 +3453,74 @@ class Worksheet(xmlwriter.XMLwriter):
         # Check if the table range overlaps a previous merged or table range.
         # This is a critical file corruption error in Excel.
         cell_range = xl_range(first_row, first_col, last_row, last_col)
-        for row in range(first_row, last_row + 1):
-            for col in range(first_col, last_col + 1):
-                if self.table_cells.get((row, col)):
-                    previous_range = self.table_cells.get((row, col))
+
+        if not self.constant_memory:
+            for row in range(first_row, last_row + 1):
+                for col in range(first_col, last_col + 1):
+                    if self.table_cells.get((row, col)):
+                        previous_range = self.table_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Table range '{cell_range}' overlaps previous "
+                            f"table range '{previous_range}'."
+                        )
+
+                    if self.merged_cells.get((row, col)):
+                        previous_range = self.merged_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Table range '{cell_range}' overlaps previous "
+                            f"merge range '{previous_range}'."
+                        )
+
+                    self.table_cells[(row, col)] = cell_range
+        else:
+            # In constant_memory mode the per-cell occupancy maps would grow
+            # with the table area, so ranges are compared as rectangles.
+            for table_info in self._cm_tables:
+                if _cm_ranges_overlap(
+                    first_row,
+                    first_col,
+                    last_row,
+                    last_col,
+                    table_info["first_row"],
+                    table_info["first_col"],
+                    table_info["last_row"],
+                    table_info["last_col"],
+                ):
+                    previous_range = xl_range(
+                        table_info["first_row"],
+                        table_info["first_col"],
+                        table_info["last_row"],
+                        table_info["last_col"],
+                    )
                     raise OverlappingRange(
                         f"Table range '{cell_range}' overlaps previous "
                         f"table range '{previous_range}'."
                     )
 
-                if self.merged_cells.get((row, col)):
-                    previous_range = self.merged_cells.get((row, col))
+            for range_info in self._cm_merge_ranges:
+                if _cm_ranges_overlap(
+                    first_row,
+                    first_col,
+                    last_row,
+                    last_col,
+                    range_info[0],
+                    range_info[1],
+                    range_info[2],
+                    range_info[3],
+                ):
                     raise OverlappingRange(
                         f"Table range '{cell_range}' overlaps previous "
-                        f"merge range '{previous_range}'."
+                        f"merge range '{range_info[4]}'."
                     )
 
-                self.table_cells[(row, col)] = cell_range
+            # The table has to start at the current or a future row since
+            # earlier rows have already been written to the temp file.
+            if first_row < self.previous_row:
+                warn(
+                    "add_table() can't start before the current row in "
+                    "'constant_memory' mode"
+                )
+                return -3
 
         # Valid input parameters.
         valid_parameter = {
@@ -3503,6 +3631,11 @@ class Worksheet(xmlwriter.XMLwriter):
         table["columns"] = []
         seen_names = {}
 
+        # In constant_memory mode the table cells are generated per row when
+        # the row is flushed, so the totals row specs are recorded here. The
+        # keys are column offsets within the table.
+        total_specs = {}
+
         for col_num in range(first_col, last_col + 1):
             # Set up the default column data.
             col_data = {
@@ -3595,16 +3728,36 @@ class Worksheet(xmlwriter.XMLwriter):
 
                         value = user_data.get("total_value", 0)
 
-                        self._write_formula(last_row, col_num, formula, xformat, value)
+                        if self.constant_memory:
+                            total_specs[col_id - 1] = (
+                                "formula",
+                                formula,
+                                xformat,
+                                value,
+                            )
+                        else:
+                            self._write_formula(
+                                last_row, col_num, formula, xformat, value
+                            )
 
                     elif user_data.get("total_string"):
                         # Total label only (not a function).
                         total_string = user_data["total_string"]
                         col_data["total_string"] = total_string
 
-                        self._write_string(
-                            last_row, col_num, total_string, user_data.get("format")
-                        )
+                        if self.constant_memory:
+                            total_specs[col_id - 1] = (
+                                "string",
+                                total_string,
+                                user_data.get("format"),
+                            )
+                        else:
+                            self._write_string(
+                                last_row,
+                                col_num,
+                                total_string,
+                                user_data.get("format"),
+                            )
 
                     # Get the dxf format index.
                     if xformat is not None:
@@ -3618,40 +3771,90 @@ class Worksheet(xmlwriter.XMLwriter):
             table["columns"].append(col_data)
 
             # Write the column headers to the worksheet.
-            if options["header_row"]:
+            if options["header_row"] and not self.constant_memory:
                 self._write_string(
                     first_row, col_num, col_data["name"], col_data["name_format"]
                 )
 
             col_id += 1
 
-        # Write the cell data if supplied.
-        if "data" in options:
-            data = options["data"]
+        if self.constant_memory:
+            # In constant_memory mode the table cells are written on demand
+            # when each row is flushed. Only the data supplied via the
+            # "data" option is buffered now, and only for rows that haven't
+            # been flushed yet.
+            table_info = {
+                "table": table,
+                "first_row": first_row,
+                "first_col": first_col,
+                "last_row": last_row,
+                "last_col": last_col,
+                "first_data_row": first_data_row,
+                "last_data_row": last_data_row,
+                "header_row": bool(options["header_row"]),
+                "col_formats": col_formats,
+                "total_specs": total_specs,
+                "data": options.get("data"),
+            }
 
-            i = 0  # For indexing the row data.
-            for row in range(first_data_row, last_data_row + 1):
-                j = 0  # For indexing the col data.
-                for col in range(first_col, last_col + 1):
-                    if i < len(data) and j < len(data[i]):
-                        token = data[i][j]
-                        if j in col_formats:
-                            self._write(row, col, token, col_formats[j])
-                        else:
-                            self._write(row, col, token, None)
-                    j += 1
-                i += 1
+            # Record the worksheet dimensions that the table cells will
+            # occupy, so that later calls that depend on the dimensions (such
+            # as set_row(), which uses the current minimum column) behave the
+            # same as in normal mode, where the cells are written immediately.
+            self._cm_update_table_dimensions(
+                first_row,
+                first_col,
+                last_row,
+                last_col,
+                first_data_row,
+                last_data_row,
+                options["header_row"],
+                total_specs,
+                table["columns"],
+                options.get("data"),
+            )
 
-        # Write any columns formulas after the user supplied table data to
-        # overwrite it if required.
-        for col_id, col_num in enumerate(range(first_col, last_col + 1)):
-            column_data = table["columns"][col_id]
-            if column_data and column_data["formula"]:
-                formula_format = col_formats.get(col_id)
-                formula = column_data["formula"]
+            # Write the generated table cells for the current (buffered) row
+            # now, since the row may be flushed before the table is known to
+            # the per-row flush logic in _cm_flush_rows(). Any user data
+            # written before add_table() is overwritten here, as it is in
+            # normal mode.
+            self._cm_generate_table_row(
+                table_info,
+                self.previous_row,
+                set(self.table.get(self.previous_row, {})),
+                True,
+            )
 
+            self._cm_tables.append(table_info)
+        else:
+            # Write the cell data if supplied.
+            if "data" in options:
+                data = options["data"]
+
+                i = 0  # For indexing the row data.
                 for row in range(first_data_row, last_data_row + 1):
-                    self._write_formula(row, col_num, formula, formula_format)
+                    j = 0  # For indexing the col data.
+                    for col in range(first_col, last_col + 1):
+                        if i < len(data) and j < len(data[i]):
+                            token = data[i][j]
+                            if j in col_formats:
+                                self._write(row, col, token, col_formats[j])
+                            else:
+                                self._write(row, col, token, None)
+                        j += 1
+                    i += 1
+
+            # Write any columns formulas after the user supplied table data to
+            # overwrite it if required.
+            for col_id, col_num in enumerate(range(first_col, last_col + 1)):
+                column_data = table["columns"][col_id]
+                if column_data and column_data["formula"]:
+                    formula_format = col_formats.get(col_id)
+                    formula = column_data["formula"]
+
+                    for row in range(first_data_row, last_data_row + 1):
+                        self._write_formula(row, col_num, formula, formula_format)
 
         # Store the table data.
         self.tables.append(table)
@@ -6625,11 +6828,91 @@ class Worksheet(xmlwriter.XMLwriter):
         # row is written and the data table is reset. That way only
         # one row of data is kept in memory at any one time. We don't
         # write span data in the optimized case since it is optional.
+        if not self._cm_tables:
+            # Set the new previous row as the current row.
+            row_num = self.previous_row
+            self.previous_row = current_row_num
 
-        # Set the new previous row as the current row.
-        row_num = self.previous_row
-        self.previous_row = current_row_num
+            if (
+                row_num in self.set_rows
+                or row_num in self.comments
+                or self.table[row_num]
+            ):
+                self._cm_write_row(row_num)
 
+            # Reset table.
+            self.table.clear()
+            return
+
+        # Table-aware flush. The table cells for rows that the caller never
+        # wrote to (calculated columns, totals, etc.) are generated here.
+        if current_row_num > self.previous_row:
+            stop_row = current_row_num
+        else:
+            # Final flush: include the buffered row and extend to the last
+            # row of any table.
+            stop_row = self.previous_row + 1
+            for table_info in self._cm_tables:
+                if table_info["last_row"] >= stop_row:
+                    stop_row = table_info["last_row"] + 1
+
+        self._cm_flush_rows(self.previous_row, stop_row)
+        self.previous_row = max(self.previous_row, stop_row)
+
+        # Reset table.
+        self.table.clear()
+
+    def _cm_flush_rows(self, start_row: int, stop_row: int) -> None:
+        # Flush the buffered row and any table rows in [start_row, stop_row),
+        # generating table cells that the caller didn't write.
+        #
+        # Rows outside any table that aren't the buffered start row were not
+        # written by the original constant_memory flush and are skipped, so
+        # worksheets without tables keep exactly the previous behaviour.
+        intervals = []
+        start_covered = False
+
+        for table_info in self._cm_tables:
+            first_row = table_info["first_row"]
+            last_row = table_info["last_row"]
+
+            if first_row <= start_row <= last_row:
+                start_covered = True
+
+            lo = max(first_row, start_row)
+            hi = min(last_row, stop_row - 1)
+            if lo <= hi:
+                intervals.append((lo, hi))
+
+        if not start_covered and start_row < stop_row:
+            intervals.append((start_row, start_row))
+
+        # The table ranges don't overlap each other, so this just coalesces
+        # the start row with any adjacent table row.
+        intervals.sort()
+        merged = []
+        for lo, hi in intervals:
+            if merged and lo <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+
+        for lo, hi in merged:
+            for row_num in range(lo, hi + 1):
+                table_infos = self._cm_row_tables(row_num)
+
+                row_data = self.table.get(row_num)
+                user_cols = set(row_data) if row_data else set()
+
+                for table_info in table_infos:
+                    self._cm_generate_table_row(table_info, row_num, user_cols, False)
+
+                self._cm_write_row(row_num)
+                self.table.pop(row_num, None)
+
+    def _cm_write_row(self, row_num: int) -> None:
+        # Write a single buffered/generated row. This mirrors the original
+        # _write_single_row() body.
         if row_num in self.set_rows or row_num in self.comments or self.table[row_num]:
             # Only process rows with formatting, cell data and/or comments.
 
@@ -6653,8 +6936,187 @@ class Worksheet(xmlwriter.XMLwriter):
                 # Row attributes or comments only.
                 self._write_empty_row(row_num, span, self.set_rows[row_num])
 
-        # Reset table.
-        self.table.clear()
+    def _cm_row_tables(self, row: int):
+        # Return the constant_memory table infos covering row.
+        return [
+            table_info
+            for table_info in self._cm_tables
+            if table_info["first_row"] <= row <= table_info["last_row"]
+        ]
+
+    def _cm_update_table_dimensions(
+        self,
+        first_row,
+        first_col,
+        last_row,
+        last_col,
+        first_data_row,
+        last_data_row,
+        header_row,
+        total_specs,
+        columns,
+        data,
+    ) -> None:
+        # Record the dimensions of the cells that a constant_memory table will
+        # generate. In normal mode add_table() writes those cells immediately
+        # and they extend the worksheet dimensions, which later calls such as
+        # set_row() depend on. The cells are still only written when the row is
+        # flushed, but the dimensions have to match now.
+        min_row = None
+        max_row = None
+        min_col = None
+        max_col = None
+
+        def add(row, col_lo, col_hi):
+            nonlocal min_row, max_row, min_col, max_col
+            if min_row is None or row < min_row:
+                min_row = row
+            if max_row is None or row > max_row:
+                max_row = row
+            if min_col is None or col_lo < min_col:
+                min_col = col_lo
+            if max_col is None or col_hi > max_col:
+                max_col = col_hi
+
+        if header_row:
+            add(first_row, first_col, last_col)
+
+        for col_id in total_specs:
+            add(last_row, first_col + col_id, first_col + col_id)
+
+        if data is not None:
+            for index, row_data in enumerate(data):
+                row = first_data_row + index
+                if row > last_data_row:
+                    break
+                col_count = min(len(columns), len(row_data))
+                if col_count:
+                    add(row, first_col, first_col + col_count - 1)
+
+        formula_cols = [i for i, col in enumerate(columns) if col["formula"]]
+        if formula_cols and first_data_row <= last_data_row:
+            formula_lo = first_col + formula_cols[0]
+            formula_hi = first_col + formula_cols[-1]
+            add(first_data_row, formula_lo, formula_hi)
+            add(last_data_row, formula_lo, formula_hi)
+
+        if min_row is None:
+            return
+
+        # Dimensions are independent axes, so updating the two diagonal
+        # corners records the same global min/max as the individual cells.
+        for row, col in ((min_row, min_col), (max_row, max_col)):
+            self._check_dimensions(row, col, True, False)
+            self._check_dimensions(row, col, False, True)
+
+    def _cm_generate_table_row(self, table_info, row: int, user_cols, in_place):
+        # Generate the cells that add_table() would have written for a single
+        # row, without holding the full table in memory. The writes happen in
+        # the same order as in add_table(): header, totals, "data" option,
+        # then calculated column formulas.
+        #
+        # user_cols are the columns the caller has written itself for this
+        # row. In normal mode add_table() writes all of its cells at call
+        # time, so only caller writes made after add_table() can override
+        # them. When generating a future row at flush time (in_place False)
+        # any buffered caller cell must therefore have been written after
+        # add_table() and takes precedence. For the row that is current when
+        # add_table() is called (in_place True), the table's writes overwrite
+        # the caller's earlier data, as in normal mode.
+        table = table_info["table"]
+        columns = table["columns"]
+        col_formats = table_info["col_formats"]
+        first_col = table_info["first_col"]
+        first_row = table_info["first_row"]
+        last_row = table_info["last_row"]
+        first_data_row = table_info["first_data_row"]
+        last_data_row = table_info["last_data_row"]
+        total_specs = table_info["total_specs"]
+        data = table_info["data"]
+
+        skip = set() if in_place else set(user_cols)
+
+        is_header = table_info["header_row"] and row == first_row
+        is_total = row == last_row and bool(total_specs)
+        is_data = first_data_row <= row <= last_data_row
+
+        # Write the header row.
+        if is_header:
+            for col_id, col_data in enumerate(columns):
+                self._cm_generate_cell(
+                    row,
+                    first_col + col_id,
+                    skip,
+                    self._write_string,
+                    (col_data["name"], col_data["name_format"]),
+                )
+
+        # Write any totals row cells.
+        if is_total:
+            for col_id in sorted(total_specs):
+                spec = total_specs[col_id]
+                if spec[0] == "formula":
+                    _, formula, cell_format, value = spec
+                    if formula:
+                        self._cm_generate_cell(
+                            row,
+                            first_col + col_id,
+                            skip,
+                            self._write_formula,
+                            (formula, cell_format, value),
+                        )
+                else:
+                    _, total_string, cell_format = spec
+                    self._cm_generate_cell(
+                        row,
+                        first_col + col_id,
+                        skip,
+                        self._write_string,
+                        (total_string, cell_format),
+                    )
+
+        if not is_data:
+            return
+
+        # Write the "data" option values, if any.
+        if data is not None:
+            data_index = row - first_data_row
+            if data_index < len(data):
+                row_data = data[data_index]
+                col_count = min(len(columns), len(row_data))
+                for col_id in range(col_count):
+                    self._cm_generate_cell(
+                        row,
+                        first_col + col_id,
+                        skip,
+                        self._write,
+                        (row_data[col_id], col_formats.get(col_id)),
+                    )
+
+        # Write the calculated column formulas.
+        for col_id, col_data in enumerate(columns):
+            if col_data["formula"]:
+                self._cm_generate_cell(
+                    row,
+                    first_col + col_id,
+                    skip,
+                    self._write_formula,
+                    (col_data["formula"], col_formats.get(col_id)),
+                )
+
+    def _cm_generate_cell(self, row, col, skip, writer, args) -> None:
+        # Write a generated table cell using the normal write methods while
+        # keeping the row from being flushed. Cells in the skip set are
+        # caller writes made after add_table() and take precedence.
+        if col in skip:
+            return
+
+        previous_row = self.previous_row
+        self.previous_row = row
+        try:
+            writer(row, col, *args)
+        finally:
+            self.previous_row = previous_row
 
     def _calculate_spans(self) -> None:
         # Calculate the "spans" attribute of the <row> tag. This is an

@@ -19,8 +19,9 @@ in the Microsoft Office documentation.
 
 .. Note::
 
-   Tables aren't available in XlsxWriter when :func:`Workbook`
-   ``'constant_memory'`` mode is enabled.
+   Tables are supported when :func:`Workbook` ``'constant_memory'`` mode is
+   enabled, provided the table starts at the current row or a later one. See
+   :ref:`memory_perf`.
 
 
 add_table()

@@ -41,8 +41,20 @@ most spreadsheet applications.
 
 The trade-off when using ``'constant_memory'`` mode is that you won't be able
 to take advantage of any new features that manipulate cell data after it is
-written. Currently the :func:`add_table()` method doesn't work in this mode
-and :func:`merge_range()` and :func:`set_row()` only work for the current row.
+written. In particular :func:`merge_range()` and :func:`set_row()` only work
+for the current row.
+
+:func:`add_table()` is supported in ``'constant_memory'`` mode, but the table
+must start at the current row or a later one, since earlier rows have already
+been written. The table header, calculated column formulas and totals row are
+generated as each row is flushed, so the memory use stays flat regardless of
+the number of table rows. A table that starts before the current row returns
+``-3``. Table and merge ranges are still checked for overlaps and raise
+``OverlappingRange`` in either call order.
+
+See ``dev/performance/perf_constant_memory_table.py`` for a script that
+measures the peak RSS of a table with 3 columns, a calculated column and a
+totals row at different row counts.
 
 
 Performance Figures
